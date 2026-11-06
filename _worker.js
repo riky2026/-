@@ -1,3 +1,40 @@
+// lib/schema.ts
+var schema = [
+  "CREATE TABLE IF NOT EXISTS `assets` (\n	`id` text PRIMARY KEY NOT NULL,\n	`memory_id` text,\n	`object_key` text NOT NULL,\n	`kind` text NOT NULL,\n	`size` integer NOT NULL,\n	`position` integer NOT NULL\n)",
+  "CREATE INDEX IF NOT EXISTS `assets_memory_idx` ON `assets` (`memory_id`)",
+  "CREATE TABLE IF NOT EXISTS `attempts` (\n	`key` text PRIMARY KEY NOT NULL,\n	`count` integer NOT NULL,\n	`expires` integer NOT NULL\n)",
+  "CREATE TABLE IF NOT EXISTS `authors` (\n	`id` text PRIMARY KEY NOT NULL,\n	`token_hash` text NOT NULL\n)",
+  "CREATE UNIQUE INDEX IF NOT EXISTS `authors_token_hash_unique` ON `authors` (`token_hash`)",
+  "CREATE TABLE IF NOT EXISTS `memories` (\n	`id` text PRIMARY KEY NOT NULL,\n	`author_id` text NOT NULL,\n	`nickname` text NOT NULL,\n	`title` text NOT NULL,\n	`body` text NOT NULL,\n	`category` text NOT NULL,\n	`happened_at` text NOT NULL,\n	`tags` text NOT NULL,\n	`created_at` text NOT NULL,\n	`updated_at` text NOT NULL\n)",
+  "CREATE TABLE IF NOT EXISTS `sessions` (\n	`token_hash` text PRIMARY KEY NOT NULL,\n	`author_id` text NOT NULL,\n	`role` text NOT NULL,\n	`expires` integer NOT NULL,\n	`version` integer NOT NULL\n)",
+  "CREATE TABLE IF NOT EXISTS `settings` (\n	`key` text PRIMARY KEY NOT NULL,\n	`value` text NOT NULL\n)",
+  "CREATE TABLE IF NOT EXISTS `messages` (\n	`id` text PRIMARY KEY NOT NULL,\n	`author_id` text NOT NULL,\n	`nickname` text NOT NULL,\n	`body` text NOT NULL,\n	`created_at` text NOT NULL,\n	`updated_at` text NOT NULL\n)",
+  "CREATE INDEX IF NOT EXISTS `messages_created_idx` ON `messages` (`created_at`)",
+  "CREATE TABLE IF NOT EXISTS uploaded_files(id TEXT PRIMARY KEY NOT NULL,owner_id TEXT NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,size INTEGER NOT NULL CHECK(size>0 AND size<=5242880),parts INTEGER NOT NULL,state TEXT NOT NULL CHECK(state IN('pending','ready','attached')),created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)",
+  "CREATE INDEX IF NOT EXISTS uploaded_owner_recent_idx ON uploaded_files(owner_id,created_at)",
+  "CREATE INDEX IF NOT EXISTS uploaded_expiry_idx ON uploaded_files(state,updated_at)",
+  "CREATE TABLE IF NOT EXISTS media_chunks(upload_id TEXT NOT NULL REFERENCES uploaded_files(id) ON DELETE CASCADE,part INTEGER NOT NULL,content TEXT NOT NULL,bytes INTEGER NOT NULL CHECK(bytes>0 AND bytes<=262144),checksum TEXT NOT NULL,PRIMARY KEY(upload_id,part))",
+  "CREATE TABLE IF NOT EXISTS asset_media_links(asset_id TEXT PRIMARY KEY NOT NULL REFERENCES assets(id) ON DELETE CASCADE,upload_id TEXT UNIQUE NOT NULL REFERENCES uploaded_files(id) ON DELETE CASCADE)",
+  "CREATE TABLE IF NOT EXISTS media_usage(id INTEGER PRIMARY KEY CHECK(id=1),bytes INTEGER NOT NULL CONSTRAINT album_media_budget CHECK(bytes>=0 AND bytes<=157286400))",
+  "INSERT OR IGNORE INTO media_usage(id,bytes) SELECT 1,COALESCE(SUM(size),0) FROM uploaded_files",
+  "CREATE TRIGGER IF NOT EXISTS media_quota_add AFTER INSERT ON uploaded_files BEGIN UPDATE media_usage SET bytes=bytes+NEW.size WHERE id=1; END",
+  "CREATE TRIGGER IF NOT EXISTS media_quota_remove AFTER DELETE ON uploaded_files BEGIN UPDATE media_usage SET bytes=bytes-OLD.size WHERE id=1; END",
+  "CREATE TRIGGER IF NOT EXISTS media_delete_attachment AFTER DELETE ON assets WHEN substr(OLD.object_key,1,3)='db:' BEGIN DELETE FROM uploaded_files WHERE id=substr(OLD.object_key,4); END"
+];
+var ready = /* @__PURE__ */ new WeakMap();
+async function ensureSchema(db) {
+  let task = ready.get(db);
+  if (!task) {
+    task = db.batch(schema.map((sql) => db.prepare(sql))).then(() => {
+    }).catch((error) => {
+      ready.delete(db);
+      throw error;
+    });
+    ready.set(db, task);
+  }
+  await task;
+}
+
 // lib/security.ts
 var ApiError = class extends Error {
   status;
@@ -47,6 +84,17 @@ function validateMemory(input) {
   if (tags.length > 10 || tags.some((x) => x.length > 30)) throw new ApiError("\u6700\u591A\u586B\u5199 10 \u4F4D\u670B\u53CB\uFF0C\u6BCF\u4E2A\u540D\u5B57\u6700\u591A 30 \u5B57\u3002");
   return { title, nickname, body, category, happenedAt, tags };
 }
+function fileKind(bytes2, declared) {
+  const s = (start, end) => String.fromCharCode(...bytes2.slice(start, end));
+  let kind = "";
+  if (bytes2[0] === 255 && bytes2[1] === 216 && bytes2[2] === 255) kind = "image/jpeg";
+  else if (s(0, 8) === "\x89PNG\r\n\n") kind = "image/png";
+  else if (s(0, 4) === "RIFF" && s(8, 12) === "WEBP") kind = "image/webp";
+  else if (s(0, 3) === "ID3" || bytes2[0] === 255 && (bytes2[1] & 224) === 224) kind = "audio/mpeg";
+  else if (s(4, 8) === "ftyp" && ["audio/mp4", "audio/x-m4a"].includes(declared)) kind = "audio/mp4";
+  if (!kind || !kind.startsWith("audio/") && declared !== kind) throw new ApiError("\u6587\u4EF6\u683C\u5F0F\u4E0D\u652F\u6301\uFF0C\u8BF7\u4F7F\u7528 JPG\u3001PNG\u3001WebP \u7167\u7247\u6216 MP3\u3001M4A \u97F3\u4E50\u3002");
+  return kind;
+}
 function parseRange(header, size) {
   const match = /^bytes=(\d*)-(\d*)$/.exec(header);
   if (!match || !match[1] && !match[2]) throw new ApiError("\u65E0\u6548\u7684\u97F3\u9891\u8303\u56F4\u3002", 416);
@@ -62,8 +110,8 @@ function cookie(request, name, value, days) {
   return `${name}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(days * 86400)}${new URL(request.url).protocol === "https:" ? "; Secure" : ""}`;
 }
 async function boundedForm(request) {
-  const limit = 32 * 1024 * 1024;
-  if (Number(request.headers.get("content-length") || 0) > limit) throw new ApiError("\u6BCF\u6B21\u53D1\u5E03\u9644\u4EF6\u5408\u8BA1\u4E0D\u80FD\u8D85\u8FC7 30 MB\u3002", 413);
+  const limit = 64 * 1024;
+  if (Number(request.headers.get("content-length") || 0) > limit) throw new ApiError("\u56DE\u5FC6\u8868\u5355\u8FC7\u5927\uFF0C\u8BF7\u51CF\u5C11\u6587\u5B57\u5185\u5BB9\u3002", 413);
   const reader = request.body?.getReader();
   if (!reader) throw new ApiError("\u6CA1\u6709\u63D0\u4EA4\u5185\u5BB9\u3002");
   const chunks = [];
@@ -74,17 +122,179 @@ async function boundedForm(request) {
     total += value.length;
     if (total > limit) {
       await reader.cancel();
-      throw new ApiError("\u6BCF\u6B21\u53D1\u5E03\u9644\u4EF6\u5408\u8BA1\u4E0D\u80FD\u8D85\u8FC7 30 MB\u3002", 413);
+      throw new ApiError("\u56DE\u5FC6\u8868\u5355\u8FC7\u5927\uFF0C\u8BF7\u51CF\u5C11\u6587\u5B57\u5185\u5BB9\u3002", 413);
     }
     chunks.push(value);
   }
-  const bytes = new Uint8Array(total);
+  const bytes2 = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
-    bytes.set(chunk, offset);
+    bytes2.set(chunk, offset);
     offset += chunk.length;
   }
-  return new Request(request.url, { method: "POST", headers: { "content-type": request.headers.get("content-type") || "" }, body: bytes }).formData();
+  return new Request(request.url, { method: "POST", headers: { "content-type": request.headers.get("content-type") || "" }, body: bytes2 }).formData();
+}
+
+// lib/storage.ts
+var CHUNK_BYTES = 256 * 1024;
+var PHOTO_LIMIT = 2 * 1024 * 1024;
+var AUDIO_LIMIT = 5 * 1024 * 1024;
+var STORAGE_LIMIT = 150 * 1024 * 1024;
+var kinds = ["image/jpeg", "image/png", "image/webp", "audio/mpeg", "audio/mp4"];
+var noCache = { "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" };
+function json(value, status = 200) {
+  return Response.json(value, { status, headers: noCache });
+}
+async function bytes(request, limit) {
+  if (Number(request.headers.get("Content-Length") || 0) > limit) throw new ApiError("\u4E0A\u4F20\u5206\u6BB5\u8D85\u8FC7\u5927\u5C0F\u9650\u5236\u3002", 413);
+  const reader = request.body?.getReader();
+  if (!reader) throw new ApiError("\u4E0A\u4F20\u5185\u5BB9\u4E3A\u7A7A\u3002");
+  let size = 0;
+  const chunks = [];
+  while (true) {
+    const result = await reader.read();
+    if (result.done) break;
+    size += result.value.byteLength;
+    if (size > limit) {
+      await reader.cancel();
+      throw new ApiError("\u4E0A\u4F20\u5206\u6BB5\u8D85\u8FC7\u5927\u5C0F\u9650\u5236\u3002", 413);
+    }
+    chunks.push(result.value);
+  }
+  const output = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return output;
+}
+function encode(data) {
+  const native = data.toBase64;
+  if (native) return native.call(data);
+  let binary = "";
+  for (let i = 0; i < data.length; i += 8192) binary += String.fromCharCode(...data.subarray(i, i + 8192));
+  return btoa(binary);
+}
+function decode(value) {
+  const native = Uint8Array.fromBase64;
+  if (native) return native(value);
+  const binary = atob(value), data = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) data[i] = binary.charCodeAt(i);
+  return data;
+}
+function storageError(error) {
+  const message = error instanceof Error ? error.message : "";
+  if (message.includes("album_media_budget")) throw new ApiError("\u9644\u4EF6\u7A7A\u95F4\u5DF2\u6EE1\uFF0C\u8BF7\u8054\u7CFB\u7EAA\u5FF5\u518C\u4E3B\u4EBA\u5220\u9664\u4E0D\u518D\u9700\u8981\u7684\u5185\u5BB9\u3002", 507);
+  if (message.includes("UNIQUE constraint failed: asset_media_links.upload_id")) throw new ApiError("\u8FD9\u4EFD\u9644\u4EF6\u5DF2\u4FDD\u5B58\uFF0C\u8BF7\u5237\u65B0\u540E\u518D\u8BD5\u3002", 409);
+  if (message.includes("FOREIGN KEY constraint failed")) throw new ApiError("\u8FD9\u4EFD\u4E0A\u4F20\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u9009\u62E9\u6587\u4EF6\u3002", 409);
+  throw error;
+}
+async function cleanupUploads(db, age = 36e5) {
+  return db.prepare("DELETE FROM uploaded_files WHERE id IN(SELECT id FROM uploaded_files WHERE state IN('pending','ready') AND updated_at<? ORDER BY updated_at LIMIT 20)").bind(Date.now() - age).run();
+}
+async function storageInfo(db) {
+  const row = await db.prepare("SELECT bytes FROM media_usage WHERE id=1").first();
+  return { used: row?.bytes || 0, limit: STORAGE_LIMIT, photoLimit: PHOTO_LIMIT, audioLimit: AUDIO_LIMIT };
+}
+async function uploads(request, db, actor, path) {
+  const method = request.method, id = path[1];
+  if (!id && method === "POST") {
+    const input = JSON.parse(new TextDecoder().decode(await bytes(request, 4096))), name = text(input.name, 180, true), kind = text(input.kind, 40, true), size = input.size;
+    if (!kinds.includes(kind) || typeof size !== "number" || !Number.isSafeInteger(size) || size < 1 || size > (kind.startsWith("image/") ? PHOTO_LIMIT : AUDIO_LIMIT)) throw new ApiError("\u7167\u7247\u6700\u591A 2 MB\uFF0C\u97F3\u4E50\u6700\u591A 5 MB\uFF0C\u8BF7\u9009\u62E9\u652F\u6301\u7684\u7167\u7247\u6216 MP3\u3001M4A \u6587\u4EF6\u3002", 413);
+    await cleanupUploads(db);
+    const counts = await db.prepare("SELECT SUM(CASE WHEN state IN('pending','ready') THEN 1 ELSE 0 END) AS pending,SUM(CASE WHEN created_at>? THEN 1 ELSE 0 END) AS recent FROM uploaded_files WHERE owner_id=?").bind(Date.now() - 6e4, actor.author_id).first();
+    if ((counts?.pending || 0) >= 20 || (counts?.recent || 0) >= 30) throw new ApiError("\u6B63\u5728\u4E0A\u4F20\u7684\u6587\u4EF6\u8F83\u591A\uFF0C\u8BF7\u7A0D\u7B49\u7247\u523B\u518D\u7EE7\u7EED\u3002", 429);
+    const uploadId = crypto.randomUUID(), now = Date.now();
+    try {
+      await db.prepare("INSERT INTO uploaded_files(id,owner_id,name,kind,size,parts,state,created_at,updated_at) VALUES(?,?,?,?,?,?,'pending',?,?)").bind(uploadId, actor.author_id, name, kind, size, Math.ceil(size / CHUNK_BYTES), now, now).run();
+    } catch (error) {
+      storageError(error);
+    }
+    return json({ id: uploadId, chunkBytes: CHUNK_BYTES }, 201);
+  }
+  if (!id || !/^[-a-f0-9]{36}$/.test(id)) throw new ApiError("\u4E0A\u4F20\u5165\u53E3\u4E0D\u5B58\u5728\u3002", 404);
+  const file = await db.prepare("SELECT * FROM uploaded_files WHERE id=? AND owner_id=?").bind(id, actor.author_id).first();
+  if (!file) throw new ApiError("\u8FD9\u4EFD\u4E0A\u4F20\u4E0D\u5B58\u5728\u6216\u5DF2\u8FC7\u671F\u3002", 404);
+  if (method === "DELETE" && !path[2]) {
+    const result = await db.prepare("DELETE FROM uploaded_files WHERE id=? AND owner_id=? AND state IN('pending','ready')").bind(id, actor.author_id).run();
+    if (!result.meta.changes) throw new ApiError("\u5DF2\u53D1\u5E03\u7684\u9644\u4EF6\u53EA\u80FD\u7531\u4E3B\u4EBA\u5220\u9664\u56DE\u5FC6\u65F6\u79FB\u9664\u3002", 403);
+    return json({ ok: true });
+  }
+  if (path[2] === "chunks" && method === "PUT") {
+    const part = Number(path[3]);
+    if (!/^\d+$/.test(path[3] || "") || part < 0 || part >= file.parts) throw new ApiError("\u4E0A\u4F20\u5206\u6BB5\u7F16\u53F7\u65E0\u6548\u3002");
+    if (file.state !== "pending") throw new ApiError("\u8FD9\u4EFD\u4E0A\u4F20\u5DF2\u7ECF\u5B8C\u6210\u3002", 409);
+    const data = await bytes(request, CHUNK_BYTES), expected = Math.min(CHUNK_BYTES, file.size - part * CHUNK_BYTES);
+    if (data.length !== expected) throw new ApiError("\u4E0A\u4F20\u5206\u6BB5\u5927\u5C0F\u4E0D\u6B63\u786E\uFF0C\u8BF7\u91CD\u65B0\u9009\u62E9\u6587\u4EF6\u3002");
+    if (part === 0 && fileKind(data.subarray(0, 32), file.kind) !== file.kind) throw new ApiError("\u6587\u4EF6\u5185\u5BB9\u4E0E\u683C\u5F0F\u4E0D\u7B26\u3002");
+    const encoded = encode(data), checksum = await digest(encoded), prior = await db.prepare("SELECT checksum FROM media_chunks WHERE upload_id=? AND part=?").bind(id, part).first();
+    if (prior) {
+      if (prior.checksum !== checksum) throw new ApiError("\u540C\u4E00\u5206\u6BB5\u7684\u5185\u5BB9\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u91CD\u65B0\u4E0A\u4F20\u3002", 409);
+      return json({ ok: true });
+    }
+    await db.batch([db.prepare("INSERT INTO media_chunks(upload_id,part,content,bytes,checksum) VALUES(?,?,?,?,?) ON CONFLICT(upload_id,part) DO NOTHING").bind(id, part, encoded, data.length, checksum), db.prepare("UPDATE uploaded_files SET updated_at=? WHERE id=? AND state='pending'").bind(Date.now(), id)]);
+    const saved = await db.prepare("SELECT checksum FROM media_chunks WHERE upload_id=? AND part=?").bind(id, part).first();
+    if (saved?.checksum !== checksum) throw new ApiError("\u540C\u4E00\u5206\u6BB5\u7684\u5185\u5BB9\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u91CD\u65B0\u4E0A\u4F20\u3002", 409);
+    return json({ ok: true });
+  }
+  if (path[2] === "complete" && method === "POST") {
+    if (file.state === "ready") return json({ id, kind: file.kind, size: file.size });
+    if (file.state !== "pending") throw new ApiError("\u8FD9\u4EFD\u9644\u4EF6\u5DF2\u7ECF\u53D1\u5E03\u3002", 409);
+    const sum = await db.prepare("SELECT COUNT(*) AS count,COALESCE(SUM(bytes),0) AS size FROM media_chunks WHERE upload_id=?").bind(id).first();
+    if (sum?.count !== file.parts || sum.size !== file.size) throw new ApiError("\u9644\u4EF6\u5C1A\u672A\u4F20\u5B8C\uFF0C\u8BF7\u91CD\u65B0\u4E0A\u4F20\u3002", 409);
+    await db.prepare("UPDATE uploaded_files SET state='ready',updated_at=? WHERE id=? AND state='pending'").bind(Date.now(), id).run();
+    return json({ id, kind: file.kind, size: file.size });
+  }
+  throw new ApiError("\u6CA1\u6709\u627E\u5230\u4E0A\u4F20\u5165\u53E3\u3002", 404);
+}
+async function ownedReady(db, actor, value) {
+  if (!Array.isArray(value) || value.length > 10 || value.some((id) => typeof id !== "string") || new Set(value).size !== value.length) throw new ApiError("\u9644\u4EF6\u9009\u62E9\u65E0\u6548\u3002");
+  if (!value.length) return [];
+  const { results } = await db.prepare(`SELECT * FROM uploaded_files WHERE owner_id=? AND state='ready' AND id IN(${value.map(() => "?").join(",")})`).bind(actor.author_id, ...value).all();
+  if (results.length !== value.length) throw new ApiError("\u9644\u4EF6\u5C1A\u672A\u4E0A\u4F20\u5B8C\u6210\u6216\u4E0D\u5C5E\u4E8E\u5F53\u524D\u8BBF\u95EE\u8005\u3002", 403);
+  return value.map((id) => results.find((file) => file.id === id));
+}
+function attachStatements(db, file, assetId) {
+  return [db.prepare("INSERT INTO asset_media_links(asset_id,upload_id) VALUES(?,?)").bind(assetId, file.id), db.prepare("UPDATE uploaded_files SET state='attached',updated_at=? WHERE id=? AND state='ready'").bind(Date.now(), file.id)];
+}
+async function uploadedMedia(request, db, id) {
+  const file = await db.prepare("SELECT * FROM uploaded_files WHERE id=? AND state='attached'").bind(id).first();
+  if (!file) throw new ApiError("\u9644\u4EF6\u5DF2\u7ECF\u4E0D\u5B58\u5728\u3002", 404);
+  let range;
+  try {
+    const value = request.headers.get("Range");
+    if (value) range = parseRange(value, file.size);
+  } catch {
+    return new Response(null, { status: 416, headers: { ...noCache, "Content-Range": "bytes */" + file.size } });
+  }
+  const offset = range?.offset || 0, length = range?.length || file.size, start = Math.floor(offset / CHUNK_BYTES), last = Math.floor((offset + length - 1) / CHUNK_BYTES);
+  let part = start, cancelled = false;
+  const body = new ReadableStream({ async pull(controller) {
+    if (cancelled) return;
+    if (part > last) {
+      controller.close();
+      return;
+    }
+    try {
+      const row = await db.prepare("SELECT content,bytes FROM media_chunks WHERE upload_id=? AND part=?").bind(id, part).first();
+      if (cancelled) return;
+      if (!row) throw Error("\u97F3\u9891\u6216\u7167\u7247\u6587\u4EF6\u4E0D\u5B8C\u6574\u3002");
+      const data = decode(row.content);
+      if (data.length !== row.bytes) throw Error("\u9644\u4EF6\u5206\u6BB5\u635F\u574F\u3002");
+      const begin = part === start ? offset - part * CHUNK_BYTES : 0, end = part === last ? offset + length - part * CHUNK_BYTES : data.length;
+      part++;
+      controller.enqueue(data.subarray(begin, end));
+      if (part > last) controller.close();
+    } catch (error) {
+      controller.error(error);
+    }
+  }, cancel() {
+    cancelled = true;
+  } });
+  const headers = { ...noCache, "Content-Type": file.kind, "Content-Disposition": "inline", "Content-Length": String(length), "Accept-Ranges": "bytes" };
+  if (range) headers["Content-Range"] = `bytes ${offset}-${offset + length - 1}/${file.size}`;
+  return new Response(body, { status: range ? 206 : 200, headers });
 }
 
 // lib/copy.ts
@@ -95,6 +305,12 @@ var sections = {
     ["pack.loading", "\u56FE\u5E93\u52A0\u8F7D\u63D0\u793A", "\u6B63\u5728\u6253\u5F00\u56FE\u5E93\u2026"],
     ["pack.empty", "\u7A7A\u56FE\u5E93\u8BF4\u660E", "\u56FE\u5E93\u91CC\u8FD8\u6CA1\u6709\u7167\u7247\uFF0C\u4E5F\u53EF\u4EE5\u5148\u5199\u4E0B\u6587\u5B57\u56DE\u5FC6\u3002"],
     ["pack.noAudio", "\u4E0D\u914D\u97F3\u4E50\u9009\u9879", "\u4E0D\u6DFB\u52A0\u97F3\u4E50"]
+  ],
+  "\u4E0A\u4F20\u8BF4\u660E": [
+    ["upload.photos", "\u7167\u7247\u5927\u5C0F\u63D0\u793A", "\u6700\u591A 9 \u5F20\uFF0C\u6BCF\u5F20\u4FDD\u5B58\u540E\u4E0D\u8D85\u8FC7 2 MB\uFF0C\u5927\u7167\u7247\u81EA\u52A8\u538B\u7F29"],
+    ["upload.audio", "\u97F3\u4E50\u5927\u5C0F\u63D0\u793A", "MP3\u3001M4A\uFF0C\u6BCF\u9996\u6700\u591A 5 MB"],
+    ["upload.preparing", "\u538B\u7F29\u8FDB\u5EA6\u63D0\u793A", "\u6B63\u5728\u538B\u7F29\u7167\u7247\u2026"],
+    ["upload.progress", "\u5206\u6BB5\u4E0A\u4F20\u8FDB\u5EA6", "\u6B63\u5728\u4E0A\u4F20 {index}/{total}\uFF08{percent}%\uFF09"]
   ],
   "\u5165\u53E3\u9875": [
     ["brand.english", "\u540D\u5B57\u4E0B\u65B9\u82F1\u6587", "OUR LITTLE TIME CAPSULE"],
@@ -191,11 +407,11 @@ var sections = {
     ["editor.friends", "\u670B\u53CB\u6807\u7B7E", "\u4E00\u8D77\u51FA\u73B0\u7684\u670B\u53CB"],
     ["editor.friendsPlaceholder", "\u670B\u53CB\u63D0\u793A", "\u591A\u4E2A\u540D\u5B57\u7528\u9017\u53F7\u9694\u5F00"],
     ["editor.photos", "\u7167\u7247\u6807\u7B7E", "\u653E\u8FDB\u51E0\u5F20\u7167\u7247"],
-    ["editor.photoLimit", "\u7167\u7247\u9650\u5236\u63D0\u793A", "\u6700\u591A 9 \u5F20 \xB7 \u6BCF\u5F20 10 MB"],
+    ["editor.photoLimit", "\u7167\u7247\u9650\u5236\u63D0\u793A", "\u6700\u591A 9 \u5F20 \xB7 \u6BCF\u5F20\u4FDD\u5B58\u540E\u6700\u591A 2 MB"],
     ["editor.addPhoto", "\u6DFB\u52A0\u7167\u7247\u6309\u94AE", "\u6DFB\u52A0\u7167\u7247"],
     ["editor.audio", "\u56DE\u5FC6\u914D\u4E50\u6807\u7B7E", "\u7ED9\u56DE\u5FC6\u914D\u4E00\u9996\u6B4C"],
     ["editor.audioKept", "\u5DF2\u6DFB\u52A0\u97F3\u4E50\u63D0\u793A", "\u5DF2\u6DFB\u52A0\u4E00\u9996\u97F3\u4E50"],
-    ["editor.audioHint", "\u97F3\u4E50\u9650\u5236\u63D0\u793A", "\u53EF\u9009 \xB7 MP3 / M4A \xB7 \u6700\u5927 20 MB"],
+    ["editor.audioHint", "\u97F3\u4E50\u9650\u5236\u63D0\u793A", "\u53EF\u9009 \xB7 MP3 / M4A \xB7 \u6700\u5927 5 MB"],
     ["editor.chooseAudio", "\u9009\u62E9\u97F3\u4E50\u6309\u94AE", "\u9009\u62E9\u97F3\u4E50"],
     ["editor.footer", "\u4FDD\u5B58\u8BF4\u660E", "\u4FDD\u5B58\u540E\uFF0C\u670B\u53CB\u4EEC\u5C31\u80FD\u770B\u89C1\u8FD9\u6BB5\u56DE\u5FC6\u3002"],
     ["editor.saving", "\u4FDD\u5B58\u4E2D\u63D0\u793A", "\u6B63\u5728\u6536\u85CF\u2026"],
@@ -250,15 +466,20 @@ function parseCatalog(value) {
 
 // lib/server.ts
 var defaults = { title: "\u65F6\u5149\u7EAA\u5FF5\u518C", welcome: "\u628A\u6563\u843D\u5728\u5C81\u6708\u91CC\u7684\u6211\u4EEC\uFF0C\u91CD\u65B0\u6536\u85CF\u5728\u4E00\u8D77\u3002", showExamples: "true", accessVersion: "1" };
-var noCache = { "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" };
-function json(value, status = 200) {
-  return new Response(JSON.stringify(value), { status, headers: { ...noCache, "Content-Type": "application/json; charset=utf-8" } });
+var noCache2 = { "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" };
+function json2(value, status = 200) {
+  return new Response(JSON.stringify(value), { status, headers: { ...noCache2, "Content-Type": "application/json; charset=utf-8" } });
 }
 function runtime(env) {
-  if (!env.DB || !env.ASSETS || !(env.ALBUM_CODES || env.ALBUM_CODE) || !env.ADMIN_CODE || !env.APP_SECRET) {
-    console.error("Missing binding names:", [["DB", !!env.DB], ["ASSETS", !!env.ASSETS], ["ALBUM_CODES", !!(env.ALBUM_CODES || env.ALBUM_CODE)], ["ADMIN_CODE", !!env.ADMIN_CODE], ["APP_SECRET", !!env.APP_SECRET]].filter(([, present]) => !present).map(([key]) => key).join(","));
-    throw new ApiError("\u7EAA\u5FF5\u518C\u6B63\u5728\u914D\u7F6E\u4E2D\uFF0C\u8BF7\u68C0\u67E5 D1 \u7ED1\u5B9A\u548C\u4E09\u4E2A\u79D8\u5BC6\u53D8\u91CF\u3002", 503);
-  }
+  const missing = [];
+  if (!env.DB || typeof env.DB.prepare !== "function") missing.push("DB\uFF08D1 \u6570\u636E\u5E93\u7ED1\u5B9A\uFF09");
+  if (!env.ASSETS) missing.push("\u7F51\u7AD9\u9759\u6001\u6587\u4EF6");
+  if (!(env.ALBUM_CODES || env.ALBUM_CODE)) missing.push("ALBUM_CODES");
+  if (!env.ADMIN_CODE) missing.push("ADMIN_CODE");
+  if (!env.APP_SECRET || env.APP_SECRET.length < 32) missing.push("APP_SECRET\uFF08\u81F3\u5C11 32 \u5B57\u7B26\uFF09");
+  if (missing.length) throw new ApiError("\u540E\u53F0\u7F3A\u5C11\u914D\u7F6E\uFF1A" + missing.join("\u3001") + "\u3002\u8BF7\u5728 Cloudflare \u751F\u4EA7\u73AF\u5883\u8865\u9F50\u5E76\u91CD\u65B0\u90E8\u7F72\u3002", 503);
+  const codes = configuredAccessCodes(env);
+  if (codes.includes(env.ADMIN_CODE)) throw new ApiError("\u7BA1\u7406\u53E3\u4EE4\u4E0D\u80FD\u4E0E\u8BBF\u95EE\u53E3\u4EE4\u76F8\u540C\u3002", 503);
   return env;
 }
 async function settings(env) {
@@ -266,8 +487,11 @@ async function settings(env) {
   return { ...defaults, ...Object.fromEntries(results.map((x) => [x.key, x.value])) };
 }
 function backgroundId(s, catalog) {
-  const id = s.backgroundMediaId ?? catalog.backgroundId;
+  const id = catalog.backgroundId;
   return catalog.files.some((file) => file.id === id && file.kind.startsWith("audio/")) ? id : "";
+}
+function backgroundMode(s) {
+  return ["default", "uploaded", "off"].includes(s.backgroundMode) ? s.backgroundMode : s.backgroundAssetId ? "uploaded" : "default";
 }
 function displaySettings(s, catalog) {
   let copy = {};
@@ -275,8 +499,8 @@ function displaySettings(s, catalog) {
     copy = JSON.parse(s.copy || "{}");
   } catch {
   }
-  const backgroundMediaId = backgroundId(s, catalog);
-  return { title: s.title, welcome: s.welcome, showExamples: s.showExamples === "true", hasBackground: !!backgroundMediaId, backgroundMediaId, copy };
+  const mode = backgroundMode(s), hasDefaultBackground = !!backgroundId(s, catalog), hasUploadedBackground = !!s.backgroundAssetId;
+  return { title: s.title, welcome: s.welcome, showExamples: s.showExamples === "true", backgroundMode: mode, hasBackground: mode === "default" ? hasDefaultBackground : mode === "uploaded" ? hasUploadedBackground : false, hasDefaultBackground, hasUploadedBackground, copy };
 }
 async function loadCatalog(request, env) {
   const response = await env.ASSETS.fetch(new Request(new URL("/_album_media/catalog.json", request.url)));
@@ -289,14 +513,14 @@ async function packedMedia(request, env, file) {
     const value = request.headers.get("Range");
     if (value) range = parseRange(value, file.size);
   } catch {
-    return new Response(null, { status: 416, headers: { ...noCache, "Content-Range": "bytes */" + file.size } });
+    return new Response(null, { status: 416, headers: { ...noCache2, "Content-Range": "bytes */" + file.size } });
   }
   const headers = new Headers();
   if (range) headers.set("Range", `bytes=${range.offset}-${range.offset + range.length - 1}`);
   const result = await env.ASSETS.fetch(new Request(new URL(file.path, request.url), { method: "GET", headers }));
   if (![200, 206, 416].includes(result.status) || result.headers.get("Content-Type")?.includes("text/html")) throw new ApiError("\u8FD9\u4EFD\u7167\u7247\u6216\u97F3\u4E50\u6CA1\u6709\u5305\u542B\u5728\u5F53\u524D\u4E0A\u4F20\u5305\u4E2D\uFF0C\u8BF7\u91CD\u65B0\u6253\u5305\u65F6\u4FDD\u7559\u539F\u6709\u6587\u4EF6\u3002", 404);
   const output = new Headers(result.headers);
-  for (const [key, value] of Object.entries(noCache)) output.set(key, value);
+  for (const [key, value] of Object.entries(noCache2)) output.set(key, value);
   output.set("Content-Type", file.kind);
   output.set("Content-Disposition", "inline");
   output.set("Accept-Ranges", "bytes");
@@ -323,10 +547,10 @@ function sliceBody(body, offset, length) {
           skipped -= value.byteLength;
           continue;
         }
-        const bytes = value.subarray(skipped, Math.min(value.byteLength, skipped + remaining));
+        const bytes2 = value.subarray(skipped, Math.min(value.byteLength, skipped + remaining));
         skipped = 0;
-        remaining -= bytes.byteLength;
-        controller.enqueue(bytes);
+        remaining -= bytes2.byteLength;
+        controller.enqueue(bytes2);
         if (!remaining) {
           await reader.cancel();
           controller.close();
@@ -376,7 +600,7 @@ async function login(request, env, s, catalog, adminOnly = false) {
   const statements = [env.DB.prepare("INSERT INTO sessions(token_hash,author_id,role,expires,version) VALUES(?,?,?,?,?)").bind(await digest(token), author.id, admin ? "admin" : "visitor", Date.now() + 7 * 864e5, Number(s.accessVersion)), env.DB.prepare("DELETE FROM attempts WHERE key=? OR expires<?").bind(ip, Date.now()), env.DB.prepare("DELETE FROM sessions WHERE expires<?").bind(Date.now())];
   if (old) statements.push(env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(await digest(old)));
   await env.DB.batch(statements);
-  const response = json({ authenticated: true, role: admin ? "admin" : "visitor", settings: displaySettings(s, catalog) });
+  const response = json2({ authenticated: true, role: admin ? "admin" : "visitor", settings: displaySettings(s, catalog) });
   response.headers.append("Set-Cookie", cookie(request, "album_session", token, 7));
   response.headers.append("Set-Cookie", cookie(request, "album_author", authorToken, 365));
   return response;
@@ -386,49 +610,53 @@ function expose(row, assets, session) {
 }
 async function list(env, session) {
   const [{ results: rows }, { results: files }] = await Promise.all([env.DB.prepare("SELECT * FROM memories ORDER BY COALESCE(NULLIF(happened_at,''),substr(created_at,1,10)) DESC,created_at DESC").all(), env.DB.prepare("SELECT * FROM assets WHERE memory_id IS NOT NULL ORDER BY position").all()]);
-  return json({ memories: rows.map((row) => expose(row, files.filter((a) => a.memory_id === row.id), session)) });
+  return json2({ memories: rows.map((row) => expose(row, files.filter((a) => a.memory_id === row.id), session)) });
 }
 async function save(request, env, session, catalog, id) {
   const old = id ? await env.DB.prepare("SELECT * FROM memories WHERE id=?").bind(id).first() : null;
   if (id && !old) throw new ApiError("\u8FD9\u6761\u56DE\u5FC6\u5DF2\u4E0D\u5B58\u5728\u3002", 404);
   if (old && old.author_id !== session.author_id && session.role !== "admin") throw new ApiError("\u53EA\u80FD\u7F16\u8F91\u81EA\u5DF1\u53D1\u5E03\u7684\u56DE\u5FC6\u3002", 403);
   const form = await boundedForm(request), data = validateMemory(Object.fromEntries(form.entries()));
-  if ([...form.values()].some((value) => value instanceof File && value.size)) throw new ApiError("\u7167\u7247\u548C\u97F3\u4E50\u8BF7\u5148\u7528\u6253\u5305\u52A9\u624B\u52A0\u5165\u7F51\u7AD9\uFF0C\u518D\u4ECE\u56FE\u5E93\u9009\u62E9\u3002");
+  if ([...form.values()].some((value) => value instanceof File && value.size)) throw new ApiError("\u8BF7\u4F7F\u7528\u65B0\u7684\u5206\u6BB5\u4E0A\u4F20\u9875\u9762\u9009\u62E9\u7167\u7247\u548C\u97F3\u4E50\u3002");
   if (old && form.get("revision") && form.get("revision") !== old.updated_at) throw new ApiError("\u8FD9\u6761\u56DE\u5FC6\u521A\u521A\u88AB\u4FEE\u6539\uFF0C\u8BF7\u91CD\u65B0\u6253\u5F00\u540E\u518D\u7F16\u8F91\u3002", 409);
   const existing = old ? (await env.DB.prepare("SELECT * FROM assets WHERE memory_id=? ORDER BY position").bind(old.id).all()).results : [];
-  let keepIds = [], mediaIds = [];
+  let keepIds = [], uploadIds = [];
   try {
     keepIds = JSON.parse(String(form.get("keepAssets") || "[]"));
-    mediaIds = JSON.parse(String(form.get("mediaIds") || "[]"));
+    uploadIds = JSON.parse(String(form.get("uploadIds") || "[]"));
   } catch {
     throw new ApiError("\u9644\u4EF6\u9009\u62E9\u65E0\u6548\u3002");
   }
   if (!Array.isArray(keepIds) || keepIds.length > 10 || keepIds.some((id2) => typeof id2 !== "string" || !existing.some((asset) => asset.id === id2)) || new Set(keepIds).size !== keepIds.length) throw new ApiError("\u9644\u4EF6\u9009\u62E9\u65E0\u6548\u3002");
-  if (!Array.isArray(mediaIds) || mediaIds.length > 10 || mediaIds.some((id2) => typeof id2 !== "string" || !catalog.files.some((file) => file.id === id2)) || new Set(mediaIds).size !== mediaIds.length) throw new ApiError("\u8BF7\u9009\u62E9\u5F53\u524D\u56FE\u5E93\u4E2D\u7684\u7167\u7247\u548C\u97F3\u4E50\u3002");
-  const kept = existing.filter((asset) => keepIds.includes(asset.id));
-  const added = mediaIds.map((id2) => catalog.files.find((file) => file.id === id2));
-  if (added.some((file) => kept.some((asset) => asset.object_key === "pack:" + file.id))) throw new ApiError("\u540C\u4E00\u6761\u56DE\u5FC6\u4E0D\u80FD\u91CD\u590D\u9009\u62E9\u540C\u4E00\u4E2A\u6587\u4EF6\u3002");
-  const kinds = [...kept.map((asset) => asset.kind), ...added.map((file) => file.kind)];
-  if (kinds.filter((kind) => kind.startsWith("image/")).length > 9) throw new ApiError("\u6BCF\u6761\u56DE\u5FC6\u6700\u591A 9 \u5F20\u7167\u7247\u3002");
-  if (kinds.filter((kind) => kind.startsWith("audio/")).length > 1) throw new ApiError("\u6BCF\u6761\u56DE\u5FC6\u6700\u591A\u6DFB\u52A0\u4E00\u9996\u97F3\u4E50\u3002");
-  if (!data.body && !kinds.length) throw new ApiError("\u5199\u4E00\u6BB5\u56DE\u5FC6\uFF0C\u6216\u4ECE\u56FE\u5E93\u9009\u62E9\u7167\u7247\u3001\u97F3\u4E50\u5427\u3002");
+  const kept = existing.filter((asset) => keepIds.includes(asset.id)), added = await ownedReady(env.DB, session, uploadIds), kinds2 = [...kept.map((asset) => asset.kind), ...added.map((file) => file.kind)];
+  if (kinds2.filter((kind) => kind.startsWith("image/")).length > 9) throw new ApiError("\u6BCF\u6761\u56DE\u5FC6\u6700\u591A 9 \u5F20\u7167\u7247\u3002");
+  if (kinds2.filter((kind) => kind.startsWith("audio/")).length > 1) throw new ApiError("\u6BCF\u6761\u56DE\u5FC6\u6700\u591A\u6DFB\u52A0\u4E00\u9996\u97F3\u4E50\u3002");
+  if (!data.body && !kinds2.length) throw new ApiError("\u5199\u4E00\u6BB5\u56DE\u5FC6\uFF0C\u6216\u6DFB\u52A0\u7167\u7247\u3001\u97F3\u4E50\u5427\u3002");
   const memoryId = id || crypto.randomUUID(), now = (/* @__PURE__ */ new Date()).toISOString(), statements = [];
   if (old) statements.push(env.DB.prepare("UPDATE memories SET nickname=?,title=?,body=?,category=?,happened_at=?,tags=?,updated_at=? WHERE id=?").bind(data.nickname, data.title, data.body, data.category, data.happenedAt, JSON.stringify(data.tags), now, memoryId));
   else statements.push(env.DB.prepare("INSERT INTO memories(id,author_id,nickname,title,body,category,happened_at,tags,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)").bind(memoryId, session.author_id, data.nickname, data.title, data.body, data.category, data.happenedAt, JSON.stringify(data.tags), now, now));
   for (const [position, asset] of kept.entries()) statements.push(env.DB.prepare("UPDATE assets SET position=? WHERE id=?").bind(position, asset.id));
-  for (const [position, file] of added.entries()) statements.push(env.DB.prepare("INSERT INTO assets(id,memory_id,object_key,kind,size,position) VALUES(?,?,?,?,?,?)").bind(crypto.randomUUID(), memoryId, "pack:" + file.id, file.kind, file.size, kept.length + position));
+  for (const [position, file] of added.entries()) {
+    const assetId = crypto.randomUUID();
+    statements.push(env.DB.prepare("INSERT INTO assets(id,memory_id,object_key,kind,size,position) VALUES(?,?,?,?,?,?)").bind(assetId, memoryId, "db:" + file.id, file.kind, file.size, kept.length + position), ...attachStatements(env.DB, file, assetId));
+  }
   for (const asset of existing.filter((asset2) => !keepIds.includes(asset2.id))) statements.push(env.DB.prepare("DELETE FROM assets WHERE id=?").bind(asset.id));
-  await env.DB.batch(statements);
-  return json({ id: memoryId }, old ? 200 : 201);
+  try {
+    await env.DB.batch(statements);
+  } catch (error) {
+    storageError(error);
+  }
+  return json2({ id: memoryId }, old ? 200 : 201);
 }
 async function remove(env, session, id) {
   requireAdmin(session);
   const row = await env.DB.prepare("SELECT id FROM memories WHERE id=?").bind(id).first();
   if (!row) throw new ApiError("\u56DE\u5FC6\u5DF2\u4E0D\u5B58\u5728\u3002", 404);
   await env.DB.batch([env.DB.prepare("DELETE FROM assets WHERE memory_id=?").bind(id), env.DB.prepare("DELETE FROM memories WHERE id=?").bind(id)]);
-  return json({ ok: true });
+  return json2({ ok: true });
 }
 async function media(request, env, asset, catalog) {
+  if (asset.object_key.startsWith("db:")) return uploadedMedia(request, env.DB, asset.object_key.slice(3));
   const file = catalog.files.find((file2) => "pack:" + file2.id === asset.object_key);
   if (!file) throw new ApiError("\u8FD9\u4EFD\u7167\u7247\u6216\u97F3\u4E50\u4E0D\u5728\u5F53\u524D\u4E0A\u4F20\u5305\u91CC\uFF0C\u8BF7\u91CD\u65B0\u6253\u5305\u65F6\u5BFC\u5165\u4E0A\u6B21\u7684\u4E0A\u4F20\u5305\u3002", 404);
   return packedMedia(request, env, file);
@@ -437,6 +665,10 @@ async function updateSettings(request, env, session, s, catalog) {
   requireAdmin(session);
   const input = await request.json();
   const values = {};
+  if (input.backgroundMode !== void 0) {
+    if (!["default", "uploaded", "off"].includes(String(input.backgroundMode)) || input.backgroundMode === "uploaded" && !s.backgroundAssetId) throw new ApiError("\u8BF7\u5148\u4E0A\u4F20\u80CC\u666F\u97F3\u4E50\u3002");
+    values.backgroundMode = String(input.backgroundMode);
+  }
   if (input.backgroundMediaId !== void 0) {
     if (typeof input.backgroundMediaId !== "string" || input.backgroundMediaId && !catalog.files.some((file) => file.id === input.backgroundMediaId && file.kind.startsWith("audio/"))) throw new ApiError("\u8BF7\u9009\u62E9\u56FE\u5E93\u4E2D\u7684\u97F3\u4E50\u3002");
     values.backgroundMediaId = input.backgroundMediaId;
@@ -470,21 +702,39 @@ async function updateSettings(request, env, session, s, catalog) {
     statements.push(env.DB.prepare("UPDATE sessions SET version=? WHERE token_hash=?").bind(Number(values.accessVersion), session.token_hash));
   }
   if (statements.length) await env.DB.batch(statements);
-  return json({ ok: true, settings: displaySettings({ ...s, ...values }, catalog) });
+  return json2({ ok: true, settings: displaySettings({ ...s, ...values }, catalog) });
 }
-async function background() {
-  throw new ApiError("\u97F3\u4E50\u8BF7\u5148\u7528\u6253\u5305\u52A9\u624B\u52A0\u5165\u7F51\u7AD9\uFF0C\u518D\u5728\u540E\u53F0\u9009\u62E9\u3002");
+async function background(request, env, session, s, catalog) {
+  requireAdmin(session);
+  const statements = [];
+  if (request.method === "DELETE") {
+    if (s.backgroundAssetId) statements.push(env.DB.prepare("DELETE FROM assets WHERE id=? AND memory_id IS NULL").bind(s.backgroundAssetId));
+    statements.push(env.DB.prepare("INSERT INTO settings(key,value) VALUES('backgroundAssetId','') ON CONFLICT(key) DO UPDATE SET value=''"), env.DB.prepare("INSERT INTO settings(key,value) VALUES('backgroundMode','off') ON CONFLICT(key) DO UPDATE SET value='off'"));
+    await env.DB.batch(statements);
+    return json2({ ok: true, settings: displaySettings({ ...s, backgroundAssetId: "", backgroundMode: "off" }, catalog) });
+  }
+  const input = await request.json(), files = await ownedReady(env.DB, session, [input.uploadId]), file = files[0];
+  if (!file.kind.startsWith("audio/")) throw new ApiError("\u80CC\u666F\u97F3\u4E50\u53EA\u80FD\u9009\u62E9 MP3 \u6216 M4A\u3002");
+  const assetId = crypto.randomUUID();
+  statements.push(env.DB.prepare("INSERT INTO assets(id,memory_id,object_key,kind,size,position) VALUES(?,NULL,?,?,?,0)").bind(assetId, "db:" + file.id, file.kind, file.size), ...attachStatements(env.DB, file, assetId), env.DB.prepare("INSERT INTO settings(key,value) VALUES('backgroundAssetId',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(assetId), env.DB.prepare("INSERT INTO settings(key,value) VALUES('backgroundMode','uploaded') ON CONFLICT(key) DO UPDATE SET value='uploaded'"));
+  if (s.backgroundAssetId) statements.push(env.DB.prepare("DELETE FROM assets WHERE id=? AND memory_id IS NULL").bind(s.backgroundAssetId));
+  try {
+    await env.DB.batch(statements);
+  } catch (error) {
+    storageError(error);
+  }
+  return json2({ ok: true, settings: displaySettings({ ...s, backgroundAssetId: assetId, backgroundMode: "uploaded" }, catalog) });
 }
 async function guestMessages(request, env, session, id) {
   if (request.method === "GET" && !id) {
     const { results } = await env.DB.prepare("SELECT id,nickname,body,updated_at AS updatedAt FROM messages ORDER BY created_at ASC,id ASC").all();
-    return json({ messages: results });
+    return json2({ messages: results });
   }
   if (request.method === "DELETE" && id) {
     requireAdmin(session);
     const result = await env.DB.prepare("DELETE FROM messages WHERE id=?").bind(id).run();
     if (!result.meta.changes) throw new ApiError("\u8FD9\u6761\u7559\u8A00\u5DF2\u4E0D\u5B58\u5728\u3002", 404);
-    return json({ ok: true });
+    return json2({ ok: true });
   }
   if (request.method === "POST" && !id || request.method === "PATCH" && id) {
     if (id) requireAdmin(session);
@@ -498,25 +748,34 @@ async function guestMessages(request, env, session, id) {
       id = crypto.randomUUID();
       await env.DB.prepare("INSERT INTO messages(id,author_id,nickname,body,created_at,updated_at) VALUES(?,?,?,?,?,?)").bind(id, session.author_id, nickname, body, now, now).run();
     }
-    return json({ id }, request.method === "POST" ? 201 : 200);
+    return json2({ id }, request.method === "POST" ? 201 : 200);
   }
   throw new ApiError("\u6CA1\u6709\u627E\u5230\u8FD9\u4E2A\u5165\u53E3\u3002", 404);
 }
 async function handleApi(request, path, bindings) {
   try {
     if (!["GET", "HEAD"].includes(request.method) && request.headers.get("Origin") !== new URL(request.url).origin) throw new ApiError("\u8BF7\u4ECE\u7EAA\u5FF5\u518C\u9875\u9762\u63D0\u4EA4\u64CD\u4F5C\u3002", 403);
-    const env = runtime(bindings), catalog = await loadCatalog(request, env), s = await settings(env), session = await current(request, env, s), method = request.method;
-    if (path[0] === "session" && method === "GET") return json({ authenticated: !!session, role: session?.role, settings: displaySettings(s, catalog) });
+    const env = runtime(bindings);
+    await ensureSchema(env.DB);
+    const catalog = await loadCatalog(request, env), s = await settings(env), session = await current(request, env, s), method = request.method;
+    if (path[0] === "session" && method === "GET") return json2({ authenticated: !!session, role: session?.role, settings: displaySettings(s, catalog) });
     if (path[0] === "login" && method === "POST") return await login(request, env, s, catalog);
     if (path[0] === "admin" && method === "POST") return await login(request, env, s, catalog, true);
     if (!session) throw new ApiError("\u8BF7\u5148\u8F93\u5165\u53E3\u4EE4\uFF0C\u6253\u5F00\u6211\u4EEC\u7684\u7EAA\u5FF5\u518C\u3002", 401);
     if (path[0] === "logout" && method === "POST") {
       await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(session.token_hash).run();
-      const response = json({ ok: true });
+      const response = json2({ ok: true });
       response.headers.append("Set-Cookie", cookie(request, "album_session", "", 0));
       return response;
     }
-    if (path[0] === "catalog" && method === "GET") return json({ files: catalog.files.map(({ id, name, kind, size }) => ({ id, name, kind, size, url: "/api/packed/" + id })) });
+    if (path[0] === "uploads") return await uploads(request, env.DB, session, path);
+    if (path[0] === "storage") {
+      requireAdmin(session);
+      if (method === "POST" && path[1] === "cleanup") await cleanupUploads(env.DB);
+      else if (method !== "GET") throw new ApiError("\u6CA1\u6709\u627E\u5230\u8FD9\u4E2A\u5165\u53E3\u3002", 404);
+      return json2(await storageInfo(env.DB));
+    }
+    if (path[0] === "catalog" && method === "GET") return json2({ files: catalog.files.map(({ id, name, kind, size }) => ({ id, name, kind, size, url: "/api/packed/" + id })) });
     if (path[0] === "packed" && path[1] && method === "GET") {
       const file = catalog.files.find((file2) => file2.id === path[1]);
       if (!file) throw new ApiError("\u6587\u4EF6\u672A\u627E\u5230\u3002", 404);
@@ -535,21 +794,31 @@ async function handleApi(request, path, bindings) {
       return await media(request, env, asset, catalog);
     }
     if (path[0] === "music" && method === "GET") {
-      const file = catalog.files.find((file2) => file2.id === backgroundId(s, catalog));
-      if (!file) throw new ApiError("\u8FD8\u6CA1\u6709\u6DFB\u52A0\u80CC\u666F\u97F3\u4E50\u3002", 404);
-      return await packedMedia(request, env, file);
+      const mode = backgroundMode(s);
+      if (mode === "off") throw new ApiError("\u80CC\u666F\u97F3\u4E50\u5DF2\u5173\u95ED\u3002", 404);
+      if (mode === "uploaded" && s.backgroundAssetId) {
+        const asset = await env.DB.prepare("SELECT * FROM assets WHERE id=? AND memory_id IS NULL").bind(s.backgroundAssetId).first();
+        if (asset) return await media(request, env, asset, catalog);
+      }
+      if (mode === "default") {
+        const file = catalog.files.find((file2) => file2.id === backgroundId(s, catalog));
+        if (file) return await packedMedia(request, env, file);
+      }
+      throw new ApiError("\u8FD8\u6CA1\u6709\u6DFB\u52A0\u80CC\u666F\u97F3\u4E50\u3002", 404);
     }
     if (path[0] === "settings" && method === "PATCH") return await updateSettings(request, env, session, s, catalog);
-    if (path[0] === "background" && method === "POST") {
-      requireAdmin(session);
-      return await background();
-    }
+    if (path[0] === "background" && ["POST", "DELETE"].includes(method)) return await background(request, env, session, s, catalog);
     throw new ApiError("\u6CA1\u6709\u627E\u5230\u8FD9\u4E2A\u5165\u53E3\u3002", 404);
   } catch (error) {
-    if (error instanceof ApiError) return json({ error: error.message }, error.status);
-    if (error instanceof SyntaxError) return json({ error: "\u63D0\u4EA4\u7684\u5185\u5BB9\u683C\u5F0F\u4E0D\u6B63\u786E\u3002" }, 400);
+    if (error instanceof ApiError) return json2({ error: error.message }, error.status);
+    if (error instanceof SyntaxError) return json2({ error: "\u63D0\u4EA4\u7684\u5185\u5BB9\u683C\u5F0F\u4E0D\u6B63\u786E\u3002" }, 400);
+    try {
+      storageError(error);
+    } catch (mapped) {
+      if (mapped instanceof ApiError) return json2({ error: mapped.message }, mapped.status);
+    }
     console.error("Album request failed:", error instanceof Error ? error.message : "unknown");
-    return json({ error: "\u6682\u65F6\u6CA1\u80FD\u5B8C\u6210\u64CD\u4F5C\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002" }, 500);
+    return json2({ error: "\u6682\u65F6\u6CA1\u80FD\u5B8C\u6210\u64CD\u4F5C\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002" }, 500);
   }
 }
 
